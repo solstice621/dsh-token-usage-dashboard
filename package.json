@@ -41,5 +41,15 @@
     "heatmap",
     "dashboard"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "compression": "1.8.2",
+    "ipaddr.js": "2.5.0",
+    "negotiator": "1.1.0",
+    "zod": "4.4.3"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "test:integration": "node --test test/*.integration.test.mjs"
+  }
 }

@@ -27,15 +27,25 @@ Codex 个人主页风格的 Token 用量统计仪表盘：5 统计卡 + GitHub �
 
 插件有两种运行形态，共用同一套聚合逻辑：
 
-- **Bundle 形态**（推荐给最终用户）：通过 `dsh plugin add` 安装；npm 包内含 `lib/index.js`（Host 半）和 `lib/client.js`（Client 半）。Host 通过 webServer 注册 `GET /api/token-stats` 与 `POST /api/token-stats/rescan`；Client 注册「设置 → 统计」页面并从 API 拉取数据。
+- **Bundle 形态**（推荐给最终用户）：通过 `dsh plugin add` 安装；npm 包内含 `lib/index.js`（Host 半）和 `lib/client.js`（Client 半）。Host 通过 `connection.fetch` 注册 `GET /api/token-stats` 与 `POST /api/token-stats/rescan`，由 Web UI 统一检查 Host、Origin 和浏览器会话；Client 注册「设置 → 统计」页面并从 API 拉取数据。
 - **动态插件形态**（维护者迭代用）：将 `host.js` / `client.js` 粘贴到 `cordis_define`，可在不重启 profile 的情况下会话内部署。
 
 数据流：
 
 1. Host 订阅 `session/event` / `session/created`，并先对历史会话日志做一次回补。
 2. 将 `assistant/message.usage`、`request/header` 模型归属、`turn/start`/`turn/end` 时长折叠为内存聚合。
-3. 聚合结果周期性写入 `~/.dsh/storages/token-stats/snapshot.json`；重启时先加载快照，再只增量折叠新事件。
+3. 聚合结果周期性写入宿主 JSON 存储单元 `token_stats`（通常为 `<DSH_HOME>/storages/token_stats.json`）；重启时先加载快照，再只增量折叠新事件。旧版 Harness 提供 `sessionPersistence.readFrom` 后缀读取；缺少该接口的版本改用 `sessionQuery.readSession` 读取完整日志，但仍只折叠新事件。
 4. Client 轮询 `GET /api/token-stats`（扫描期 2s，就绪后 30s）并渲染仪表盘。
+
+显式重新扫描会根据当前日志重建全部统计，所有读取成功后再替换旧结果；重复或并发扫描不会再次累加历史。扫描期间收到的实时事件按序合并。正常重启保留已删除会话的历史统计；显式重新扫描会清除日志已不存在的历史。扫描失败会保留上一次完整结果，并返回错误。
+
+两种形态使用宿主的 `storage` / `storage.backend.json` 服务持久化，由 JSON 后端管理根目录、原子写入和目录创建。正常 Cordis 加载需要这两个服务（已核实 DSH Desktop 0.2.1-rc.2 提供）。原生存储为空时，可只读迁移已有的 `token-stats/snapshot.json`，不修改旧文件。直接嵌入且没有原生存储的宿主仍可提供 `fs`：旧路径使用 `profileContext.home` 或显式 `dshHome`；Bundle 还能回退至 `DSH_HOME` / 操作系统用户目录下的 `.dsh`，Dynamic 无法确定 home 时仅在内存统计。动态插件继续使用 Harness 原有的认证 RPC 通道。
+
+同一宿主仅启用一种形态。Bundle 与 Dynamic 共用 `token_stats` 存储单元，该单元同时只允许一个活动句柄。
+
+## 自动化测试
+
+执行 `npm ci && npm test`，运行覆盖两种 Host 实现的回归测试。真实 Harness HTTP 与原生存储集成测试需要 Node 24 与 Harness 源码检出；运行命令、固定的契约版本和覆盖边界见 [TESTING.md](TESTING.md)。
 
 ## 🚀 安装（bundle 方式，推荐）
 

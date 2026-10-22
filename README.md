@@ -25,15 +25,25 @@ The UI follows the DSH language setting: Chinese interface → Chinese dashboard
 
 The plugin has two runnable forms that share the same aggregation logic:
 
-- **Bundle form** (recommended for end users): installed via `dsh plugin add`; the npm package contains `lib/index.js` (host half) and `lib/client.js` (client half). The host half registers `GET /api/token-stats` and `POST /api/token-stats/rescan` through the web server; the client half registers a "Settings → Stats" section and fetches the API.
+- **Bundle form** (recommended for end users): installed via `dsh plugin add`; the npm package contains `lib/index.js` (host half) and `lib/client.js` (client half). The host half registers `GET /api/token-stats` and `POST /api/token-stats/rescan` through `connection.fetch`, behind the Web UI's Host/Origin and browser-session checks; the client half registers a "Settings → Stats" section and fetches the API.
 - **Dynamic-plugin form** (for maintainers/iteration): `host.js` and `client.js` are pasted into `cordis_define` for in-session deployment without restarting the profile.
 
 Data flow:
 
 1. Host subscribes to `session/event` / `session/created` and also performs an initial backfill over historical session logs.
 2. It folds `assistant/message.usage`, `request/header` model attribution, and `turn/start`/`turn/end` durations into in-memory aggregates.
-3. Aggregates are periodically flushed to `~/.dsh/storages/token-stats/snapshot.json`; on restart the snapshot is loaded first, then only new events are incrementally folded.
+3. Aggregates are periodically flushed to the host JSON storage unit `token_stats` (normally `<DSH_HOME>/storages/token_stats.json`); on restart the snapshot is loaded first, then only new events are incrementally folded. Older Harness versions expose `sessionPersistence.readFrom` for suffix reads; versions without it use `sessionQuery.readSession` to read the full log while still folding only new events.
 4. The client polls `GET /api/token-stats` (2s while scanning, 30s after ready) and renders the dashboard.
+
+An explicit rescan rebuilds from the current logs and replaces all aggregates only after every read succeeds. Repeated or simultaneous rescans do not accumulate history again. Live events received during replay are merged in sequence order. Normal restarts retain statistics for deleted sessions; an explicit rescan removes that history when the logs are gone. A failed rescan preserves the last complete result and reports an error.
+
+Both forms use the host's `storage` / `storage.backend.json` services for persistence; the JSON backend owns its configured root, atomic writes and directory creation. These services are required for normal Cordis activation (verified on DSH Desktop 0.2.1-rc.2). When the native unit is empty, a readable legacy `token-stats/snapshot.json` is migrated without modifying the old file. Directly embedded hosts without native storage may still provide `fs`; its legacy path uses `profileContext.home`, or an explicit `dshHome`. Bundle additionally falls back to `DSH_HOME` / the OS user's `.dsh`; Dynamic without any known home stays in memory. The dynamic plugin continues to use the authenticated Harness RPC channel.
+
+Enable only one form per host. Bundle and Dynamic share the `token_stats` storage unit, which permits one active handle at a time.
+
+## Tests
+
+Run `npm ci && npm test` for regression tests covering both host implementations. The optional real-Harness HTTP and native-storage integration tests require Node 24 and a Harness source checkout; see [TESTING.md](TESTING.md) for commands, the pinned contract revision, and coverage limits.
 
 ## 🚀 Install (bundle)
 

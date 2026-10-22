@@ -1,0 +1,53 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  harness-http:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - uses: actions/checkout@v4
+        with:
+          repository: deepseek-ai/deepseek-harness
+          ref: 687f282e8625c6b8d11ff58211a90524be2e4317
+          path: .harness
+          persist-credentials: false
+          sparse-checkout: |
+            vendor/cordis
+            vendor/cosmokit
+            vendor/schemastery
+            packages/client/connection
+            packages/host/webserver
+            packages/util/brand
+            packages/core/scope
+            packages/credentials/credentials
+            packages/storage/storage
+            packages/storage/storage-json
+      - run: npm run test:integration
+        env:
+          DSH_SOURCE: ${{ github.workspace }}/.harness

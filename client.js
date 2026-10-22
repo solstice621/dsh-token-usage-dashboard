@@ -266,8 +266,33 @@ function StatCard(props) {
     props.sub ? h('div', { className: 'tks-card-sub' }, props.sub) : null)
 }
 
+// Keep each tooltip inside the heatmap's clipping boundary, including wrapped text.
+function positionTooltip(cell, wrap) {
+  if (!cell || !wrap) return
+  const tip = cell.firstElementChild
+  if (!tip) return
+  const bounds = wrap.getBoundingClientRect()
+  const anchor = cell.getBoundingClientRect()
+  const gap = 4
+  tip.style.maxWidth = Math.max(0, bounds.width - gap * 2) + 'px'
+  const box = tip.getBoundingClientRect()
+  const left = Math.max(bounds.left + gap,
+    Math.min(anchor.left + (anchor.width - box.width) / 2, bounds.right - gap - box.width))
+  const above = anchor.top - gap - box.height
+  const top = Math.max(bounds.top + gap, above >= bounds.top + gap
+    ? above : Math.min(anchor.bottom + gap, bounds.bottom - gap - box.height))
+  tip.style.left = (left - anchor.left) + 'px'
+  tip.style.top = (top - anchor.top) + 'px'
+}
+
 function Heatmap(props) {
   const wrapRef = React.useRef(null)
+  const hoveredRef = React.useRef(null)
+  const showTip = (event) => {
+    hoveredRef.current = event.currentTarget
+    positionTooltip(event.currentTarget, wrapRef.current)
+  }
+  const hideTip = () => { hoveredRef.current = null }
   const g = buildGrid(props.days, GRID_COLUMNS)
   // 宽度自适应：按容器宽度计算格子尺寸（--tks-size，4~16px）
   React.useLayoutEffect(() => {
@@ -278,6 +303,7 @@ function Heatmap(props) {
       const size = Math.max(4, Math.min(16,
         Math.floor((avail - 4 - (GRID_COLUMNS - 1) * 1) / GRID_COLUMNS)))
       el.style.setProperty('--tks-size', size + 'px')
+      positionTooltip(hoveredRef.current, el)
     }
     fit()
     if (typeof ResizeObserver !== 'undefined') {
@@ -287,16 +313,16 @@ function Heatmap(props) {
     }
     return undefined
   }, [])
-  const colCount = g.weeks.length
+  React.useLayoutEffect(() => {
+    positionTooltip(hoveredRef.current, wrapRef.current)
+  })
   const columns = g.weeks.map((week, wi) =>
     h('div', { key: wi, className: 'tks-col' },
       week.map((c, ci) => {
-        let edge = ''
-        if (wi < 8) edge = ' tks-tip-left'
-        else if (wi >= colCount - 2) edge = ' tks-tip-right'
         return h('div', {
           key: ci,
-          className: 'tks-cell tks-lv' + cellLevel(c.total, g.max) + edge,
+          className: 'tks-cell tks-lv' + cellLevel(c.total, g.max),
+          onMouseEnter: showTip, onMouseLeave: hideTip,
         }, h('span', { className: 'tks-tip' }, tipText(c)))
       })))
   // 每周柱状：每列 = 一周用量，7 格自下而上填充；最大周全满，其余按比例整数格
@@ -311,16 +337,14 @@ function Heatmap(props) {
   const filledCount = weekTotals.map((t) =>
     t <= 0 ? 0 : Math.max(1, Math.min(7, Math.round(7 * t / maxWeek))))
   const weeklyCols = g.weeks.map((w, wi) => {
-    let edge = ''
-    if (wi < 8) edge = ' tks-tip-left'
-    else if (wi >= colCount - 2) edge = ' tks-tip-right'
     const tip = weekTipText(w[0].date, w[6].date, weekTotals[wi])
     return h('div', { key: wi, className: 'tks-col' },
       w.map((c, ci) => {
         const full = ci >= 7 - filledCount[wi]
         return h('div', {
           key: ci,
-          className: 'tks-cell' + (full ? ' tks-week-full' : ' tks-lv0') + edge,
+          className: 'tks-cell' + (full ? ' tks-week-full' : ' tks-lv0'),
+          onMouseEnter: showTip, onMouseLeave: hideTip,
         }, h('span', { className: 'tks-tip' }, tip))
       }))
   })
@@ -497,11 +521,9 @@ const CSS = [
   '.tks-lv3{background:#e5764c}',
   '.tks-lv4{background:#c74e24}',
   '.tks-lv5{background:#a83a12}',
-  // 自定义悬停提示：纯 CSS 跟随 :hover，不依赖 window/document
-  '.tks-tip{display:none;position:absolute;bottom:13px;left:50%;transform:translateX(-50%);z-index:60;background:rgba(32,32,32,.94);color:#fafafa;font-size:10px;line-height:1.45;padding:2px 6px;border-radius:4px;white-space:nowrap;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.18)}',
+  // CSS 控制显隐，定位按实际尺寸避让容器边界；长文本允许换行
+  '.tks-tip{display:none;position:absolute;top:0;left:0;width:max-content;box-sizing:border-box;z-index:60;background:rgba(32,32,32,.94);color:#fafafa;font-size:10px;line-height:1.45;padding:2px 6px;border-radius:4px;white-space:normal;overflow-wrap:anywhere;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,.18)}',
   '.tks-cell:hover .tks-tip{display:block}',
-  '.tks-tip-left .tks-tip{left:-1px;transform:none}',
-  '.tks-tip-right .tks-tip{left:auto;right:-1px;transform:none}',
   // overflow:hidden：nowrap 标签文字（如「10月」/「Aug」）宽过列距，防止其撑大 scrollable overflow
   '.tks-months{display:flex;gap:1px;margin-top:6px;font-size:10px;opacity:.55;overflow:hidden}',
   // span 宽 = 格子宽，pitch = 格子宽 + 1px gap，与热力网格严格同宽对齐

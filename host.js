@@ -4,24 +4,15 @@
 //       不需要任何包装（无 import/require/TS/JSX）。
 // 依赖（部署前用 cordis_inspect_query 核对）：
 //   - Host Service：sessionQuery（listSessions / readSession）、sessionPersistence
-//     （readFrom 增量读，可选）、fs（快照写盘，可选）、timer（周期 flush，可选）
+//     （readFrom 增量读，可选）、storage / storage.backend.json（宿主快照），
+//     fs（旧快照只读迁移，直接嵌入无storage时兼作后备）、timer（周期 flush，可选）
 //   - Host Event：  session/event（emit，(session, event)）、session/created（emit，(session)）
 //   - Host Builtin：harness（handle）、console
-// 版本：v7（随客户端 v25 一起部署 = pkg-37；v6 = pkg-33）
-// v7 变更（「重启不扫盘不重建 · 删除会话保留统计」——按用户要求优化）：
-//   1. 聚合状态周期落盘：~/.dsh/storages/token-stats/snapshot.json
-//      （fs 服务不支持 ~ 展开，动态插件版用绝对路径；bundle 版用 process.env.HOME）
-//   2. 启动优先加载快照 → ready=true 立即出数，随后 sessionPersistence.readFrom(id, lastSeq+1)
-//      增量折叠（只处理新增事件，不重放全量；SQLite 后端物理 seek 后缀，不扫盘）
-//   3. 无快照 / 格式损坏 / 版本不符 → 回退 v6 全量 backfill（liveFloor + force 补折）
-//   4. 已删除会话：快照保留其历史统计，增量同步直接跳过（统计不随删除回退）；
-//      想按现存日志重建请用 rescan RPC（或重启后删掉快照文件）
-// v6 变更（修复「活跃会话 usage 不可见」——升级/重启后累计数骤降的根因）：
-//   竞争：插件启动后，活跃会话的 session/event 实时流先到达（seq 为日志顶端），把该会话
-//   lastSeq 推到顶；随后 backfill 的 readSession 全量快照回放时，水位线判断 seq<=lastSeq
-//   → 整个回放被跳过 → 只有实时流见过的尾部被统计（如 73 万 vs 真实 1.4 亿）。
-//   修复：每会话记录 liveFloor（实时流折叠过的最小 seq）；回放时 force 折叠
-//   seq < liveFloor 的头部事件（从未被折叠过），跳过实时流已覆盖的尾部——不重不漏。
+// Rescans rebuild from logs; live events are merged after ordered replay.
+// Snapshots follow profileContext.home (the resolved DSH_HOME). Embedded hosts
+// without profileContext can supply an absolute config.dshHome.
+// Normal restarts retain deleted-session history; explicit rescan rebuilds only
+// the currently available session logs.
 
 function pad2(n) { return n < 10 ? '0' + n : '' + n }
 function dayKeyOf(time) {
@@ -38,59 +29,80 @@ function usageTotal(u) {
     (u.cacheReadTokens || 0) + (u.cacheWriteTokens || 0)
 }
 
-// 快照文件（动态插件版：绝对路径；fs 服务不展开 ~）
-var SNAPSHOT_PATH = '/home/qiuzihan/.dsh/storages/token-stats/snapshot.json'
+// Dynamic code has no process/os/path globals. The launcher supplies the
+// resolved DSH_HOME as profileContext.home; embedded hosts can pass dshHome.
+function snapshotPath(ctx, config) {
+  const profile = ctx.get('profileContext')
+  const home = (profile && profile.home) ?? config.dshHome
+  if (typeof home !== 'string' || !home.trim()) return null
+  // Require an absolute path: fs.resolve does not expand '~' and its cwd may
+  // differ from the harness process. Accept POSIX, drive and UNC roots.
+  if (!/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(home)) {
+    throw new Error('token-stats dshHome must be an absolute path')
+  }
+  return home.replace(/[\\/]+$/, '') + '/storages/token-stats/snapshot.json'
+}
 var SNAPSHOT_VERSION = 1
 
 return {
-  apply(ctx) {
+  inject: ['sessionQuery', 'storage', 'storage.backend.json'],
+  apply(ctx, config = {}) {
+    const SNAPSHOT_PATH = snapshotPath(ctx, config)
     const sessionQuery = ctx.get('sessionQuery')
     const sessionPersistence = ctx.get('sessionPersistence')
-    const fs = ctx.get('fs')
+    const storage = ctx.get('storage')
+    const fs = SNAPSHOT_PATH === null ? undefined : ctx.get('fs')
+    if (SNAPSHOT_PATH === null && storage === undefined) {
+      console.error('[dsh-token-usage-dashboard] persistence disabled: provide profileContext.home or an absolute config.dshHome')
+    }
     const timer = ctx.get('timer')
 
-    // ---- 自有聚合状态（纯 JSON，不持有 live 对象）----
-    const days = new Map()      // dayKey -> {input,output,cacheRead,cacheWrite,total,requests}
-    const sessions = new Map()  // sessionId -> {lastSeq,tokens,chatMs,turns,createdAt,model,liveFloor}
-    const openTurns = new Map() // sessionId:turn -> startTime
-    const modelStats = new Map() // "provider/model" -> {tokens,requests}（request/header 归属）
+    // Replay into a private state, then publish it in one synchronous step. Live
+    // events wait behind replay so their sequence numbers cannot hide its prefix.
+    function emptyState() {
+      return {
+        days: new Map(), sessions: new Map(), openTurns: new Map(), modelStats: new Map(),
+        totalTokens: 0, totalRequests: 0, peakStepTokens: 0,
+        longestTurnMs: 0, longestChatMs: 0, longestChatSessionId: null,
+      }
+    }
+    let state = emptyState()
     let disposed = false
     let ready = false
-    let scanning = false
+    let scanning = true
     let scannedSessions = 0
-    let totalTokens = 0
-    let totalRequests = 0
-    let peakStepTokens = 0
-    let longestTurnMs = 0
-    let longestChatMs = 0
-    let longestChatSessionId = null
+    let initializing = true
+    let buffering = true
+    let retryAll = false
+    let scanPromise = null
+    let rescanPromise = null
+    let savePromise = null
     let dirty = false
     let fsTarget = null
+    let storagePromise = null
+    const bufferedEvents = new Map()
+    const createdSessions = new Set()
 
-    function sessionRec(id, createdAt) {
-      let rec = sessions.get(id)
+    function sessionRec(target, id, createdAt) {
+      let rec = target.sessions.get(id)
       if (!rec) {
-        rec = {
-          lastSeq: -1, tokens: 0, chatMs: 0, turns: 0, createdAt: createdAt || 0,
-          model: null, liveFloor: Infinity, // 实时流折叠过的最小 seq（回放头部补折用）
-        }
-        sessions.set(id, rec)
+        rec = { lastSeq: -1, tokens: 0, chatMs: 0, turns: 0,
+          createdAt: createdAt || 0, model: null }
+        target.sessions.set(id, rec)
       }
       return rec
     }
 
     function markDirty() {
       dirty = true
-      // 无 timer 服务时退化为直接写盘（fire-and-forget）
       if (timer === undefined) flushSave()
     }
 
-    function foldEvent(sessionId, event, force) {
-      const rec = sessionRec(sessionId)
-      if (typeof event.seq === 'number') {
-        if (!force && event.seq <= rec.lastSeq) return
-        if (event.seq > rec.lastSeq) rec.lastSeq = event.seq
-      }
+    function foldEvent(target, sessionId, event) {
+      if (!event || !Number.isSafeInteger(event.seq) || event.seq < 0) return
+      const rec = sessionRec(target, sessionId)
+      if (event.seq <= rec.lastSeq) return
+      rec.lastSeq = event.seq
       const type = event.type
       const data = event.data
       if (!data) return
@@ -100,10 +112,10 @@ return {
         const t = usageTotal(u)
         if (t <= 0) return
         const key = dayKeyOf(event.time)
-        let day = days.get(key)
+        let day = target.days.get(key)
         if (!day) {
           day = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, requests: 0 }
-          days.set(key, day)
+          target.days.set(key, day)
         }
         day.input += u.inputTokens || 0
         day.output += u.outputTokens || 0
@@ -111,254 +123,280 @@ return {
         day.cacheWrite += u.cacheWriteTokens || 0
         day.total += t
         day.requests += 1
-        totalTokens += t
-        totalRequests += 1
+        target.totalTokens += t
+        target.totalRequests += 1
         rec.tokens += t
-        // 模型归属：assistant/message 无 model 字段，用该会话最近一次 request/header 的 provider/model
         const mk = rec.model || 'unknown'
-        let ms = modelStats.get(mk)
+        let ms = target.modelStats.get(mk)
         if (!ms) {
           ms = { tokens: 0, requests: 0 }
-          modelStats.set(mk, ms)
+          target.modelStats.set(mk, ms)
         }
         ms.tokens += t
         ms.requests += 1
-        if (t > peakStepTokens) peakStepTokens = t
+        if (t > target.peakStepTokens) target.peakStepTokens = t
       } else if (type === 'request/header') {
-        // 记录该会话当前使用的 provider/model（供后续 usage 归属）
         const cfg = data.header && data.header.config
         if (cfg && cfg.model) rec.model = (cfg.provider || '?') + '/' + cfg.model
       } else if (type === 'turn/start') {
-        openTurns.set(sessionId + ':' + data.turn, event.time)
+        target.openTurns.set(sessionId + ':' + data.turn, event.time)
       } else if (type === 'turn/end') {
         const k = sessionId + ':' + data.turn
-        const start = openTurns.get(k)
+        const start = target.openTurns.get(k)
         if (start !== undefined) {
-          openTurns.delete(k)
+          target.openTurns.delete(k)
           const dur = Math.max(0, event.time - start)
           rec.chatMs += dur
           rec.turns += 1
-          if (dur > longestTurnMs) longestTurnMs = dur
-          if (rec.chatMs > longestChatMs) {
-            longestChatMs = rec.chatMs
-            longestChatSessionId = sessionId
+          if (dur > target.longestTurnMs) target.longestTurnMs = dur
+          if (rec.chatMs > target.longestChatMs) {
+            target.longestChatMs = rec.chatMs
+            target.longestChatSessionId = sessionId
           }
         }
       }
     }
 
-    // ---- 快照持久化 ----
+    function foldEvents(target, id, events) {
+      // Persistence returns ordered events; sorting also keeps buffered live
+      // duplicates and a concurrently delivered suffix in their causal order.
+      for (const event of events.slice().sort((a, b) => a.seq - b.seq)) {
+        foldEvent(target, id, event)
+      }
+    }
+
+    function cloneState(source) {
+      return { ...source,
+        days: new Map(Array.from(source.days, ([id, value]) => [id, { ...value }])),
+        sessions: new Map(Array.from(source.sessions, ([id, value]) => [id, { ...value }])),
+        modelStats: new Map(Array.from(source.modelStats, ([id, value]) => [id, { ...value }])),
+        openTurns: new Map(source.openTurns),
+      }
+    }
+
+    // ---- Snapshot persistence: never save partially replayed state. ----
     function serialize() {
-      const dayList = []
-      for (const entry of days) {
-        dayList.push({ date: entry[0], input: entry[1].input, output: entry[1].output,
-          cacheRead: entry[1].cacheRead, cacheWrite: entry[1].cacheWrite,
-          total: entry[1].total, requests: entry[1].requests })
-      }
-      dayList.sort((a, b) => (a.date < b.date ? -1 : 1))
-      const sessList = []
-      for (const entry of sessions) {
-        sessList.push([entry[0], {
-          lastSeq: entry[1].lastSeq, tokens: entry[1].tokens, chatMs: entry[1].chatMs,
-          turns: entry[1].turns, createdAt: entry[1].createdAt, model: entry[1].model,
-        }])
-      }
-      const modelList = []
-      for (const entry of modelStats) modelList.push([entry[0], entry[1]])
-      return JSON.stringify({
-        version: SNAPSHOT_VERSION,
-        savedAt: Date.now(),
-        totalTokens: totalTokens,
-        totalRequests: totalRequests,
-        peakStepTokens: peakStepTokens,
-        longestTurnMs: longestTurnMs,
-        longestChatMs: longestChatMs,
-        longestChatSessionId: longestChatSessionId,
-        days: dayList,
-        sessions: sessList,
-        modelStats: modelList,
-        openTurns: Array.from(openTurns.entries()),
+      return JSON.stringify({ ...state, version: SNAPSHOT_VERSION, savedAt: Date.now(),
+        days: Array.from(state.days, ([date, value]) => ({ date, ...value })),
+        sessions: Array.from(state.sessions), modelStats: Array.from(state.modelStats),
+        openTurns: Array.from(state.openTurns),
       })
     }
 
-    async function flushSave() {
-      if (!dirty || disposed || fs === undefined) return
-      dirty = false
-      try {
-        if (fsTarget === null) fsTarget = await fs.resolve(SNAPSHOT_PATH)
-        await fs.writeText(fsTarget, serialize())
-      } catch (e) {
-        dirty = true // 写失败留脏标记，下个周期重试
-        console.error('[dsh-token-usage-dashboard] snapshot write failed:', String(e))
+    // The host JSON backend owns the DSH_HOME storage root. It is separate
+    // from ctx.fs, which may represent a sandboxed or remote workspace.
+    function nativeUnit() {
+      if (storagePromise === null) {
+        storagePromise = Promise.resolve().then(() => storage.backend.get('json').kv.open({
+          name: 'token_stats', version: SNAPSHOT_VERSION, tables: [], hasGlobal: true,
+        })).catch(error => {
+          storagePromise = null
+          throw error
+        })
       }
+      return storagePromise
     }
 
-    function loadSnapshot() {
-      return fs === undefined ? false : Promise.resolve().then(async () => {
+    async function readSnapshot() {
+      if (storage !== undefined) {
+        const unit = await nativeUnit()
+        const snapshot = (await unit.loadAll()).global
+        if (snapshot !== null && snapshot !== undefined) return snapshot
+        // Migrate the previous file only when the native unit has never been written.
+        // Native storage errors must never redirect writes into the workspace FS.
+      }
+      if (fs === undefined) return null
+      fsTarget = await fs.resolve(SNAPSHOT_PATH)
+      return JSON.parse(await fs.readText(fsTarget))
+    }
+
+    async function closeStorage() {
+      if (storagePromise !== null) await (await storagePromise).close()
+    }
+
+    function flushSave() {
+      if (savePromise) return savePromise
+      if (!dirty || !ready || (storage === undefined && fs === undefined)) return Promise.resolve()
+      let failed = false
+      savePromise = Promise.resolve().then(async () => {
         try {
-          const target = await fs.resolve(SNAPSHOT_PATH)
-          const text = await fs.readText(target)
-          const snap = JSON.parse(text)
-          if (!snap || snap.version !== SNAPSHOT_VERSION ||
-              !Array.isArray(snap.days) || !Array.isArray(snap.sessions) ||
-              typeof snap.totalTokens !== 'number') return false
-          fsTarget = target
-          for (const d of snap.days) {
-            days.set(d.date, { input: d.input || 0, output: d.output || 0,
-              cacheRead: d.cacheRead || 0, cacheWrite: d.cacheWrite || 0,
-              total: d.total || 0, requests: d.requests || 0 })
+          const unit = storage === undefined ? null : await nativeUnit()
+          if (unit === null && fsTarget === null) fsTarget = await fs.resolve(SNAPSHOT_PATH)
+          while (dirty) {
+            dirty = false
+            const snapshot = serialize()
+            if (unit !== null) await unit.setGlobal(JSON.parse(snapshot))
+            else await fs.writeText(fsTarget, snapshot)
           }
-          for (const row of snap.sessions) {
-            const id = row[0]; const r = row[1]
-            sessions.set(id, { lastSeq: r.lastSeq || -1, tokens: r.tokens || 0,
-              chatMs: r.chatMs || 0, turns: r.turns || 0, createdAt: r.createdAt || 0,
-              model: r.model || null, liveFloor: Infinity })
-          }
-          for (const row of (snap.modelStats || [])) modelStats.set(row[0], row[1])
-          for (const row of (snap.openTurns || [])) openTurns.set(row[0], row[1])
-          totalTokens = snap.totalTokens
-          totalRequests = snap.totalRequests
-          peakStepTokens = snap.peakStepTokens || 0
-          longestTurnMs = snap.longestTurnMs || 0
-          longestChatMs = snap.longestChatMs || 0
-          longestChatSessionId = snap.longestChatSessionId || null
-          console.log('[dsh-token-usage-dashboard] snapshot loaded: ' + snap.days.length + ' days, ' +
-            sessions.size + ' sessions, total ' + totalTokens)
-          return true
         } catch (e) {
-          console.log('[dsh-token-usage-dashboard] no usable snapshot, fall back to full scan: ' + String(e))
-          return false
+          failed = true
+          dirty = true
+          console.error('[dsh-token-usage-dashboard] snapshot write failed:', String(e))
         }
+      }).finally(() => {
+        savePromise = null
+        // An event can arrive between the drain loop and this finalizer.
+        if (dirty && !failed && timer === undefined) return flushSave()
       })
+      return savePromise
     }
 
-    // ---- 快照模式：增量同步（不扫盘、不重建）----
-    async function foldDelta(id, fromSeq) {
+    async function loadSnapshot() {
+      if (storage === undefined && fs === undefined) return false
       try {
-        if (sessionPersistence !== undefined) {
-          // readFrom：从 fromSeq 起的存储后缀（SQLite 物理 seek，JSONL 至少不重建聚合）
-          const res = await sessionPersistence.readFrom(id, fromSeq)
-          const events = (res && res.events) || []
-          for (let i = 0; i < events.length; i += 1) {
-            if (disposed) return
-            foldEvent(id, events[i])
+        const snap = await readSnapshot()
+        if (!snap || snap.version !== SNAPSHOT_VERSION ||
+            !Array.isArray(snap.days) || !Array.isArray(snap.sessions) ||
+            !Array.isArray(snap.modelStats) || !Array.isArray(snap.openTurns)) return false
+        const loaded = emptyState()
+        function number(value) {
+          if (!Number.isFinite(value) || value < 0) throw new Error('Invalid snapshot number')
+          return value
+        }
+        for (const key of ['totalTokens', 'totalRequests', 'peakStepTokens', 'longestTurnMs', 'longestChatMs']) {
+          loaded[key] = number(snap[key])
+        }
+        loaded.longestChatSessionId = snap.longestChatSessionId || null
+        for (const d of snap.days) {
+          if (!d || typeof d.date !== 'string') throw new Error('Invalid snapshot day')
+          loaded.days.set(d.date, { input: number(d.input), output: number(d.output),
+            cacheRead: number(d.cacheRead), cacheWrite: number(d.cacheWrite),
+            total: number(d.total), requests: number(d.requests) })
+        }
+        for (const [id, r] of snap.sessions) {
+          if (typeof id !== 'string' || !r || !Number.isSafeInteger(r.lastSeq) || r.lastSeq < -1) {
+            throw new Error('Invalid snapshot session')
           }
-        } else {
-          // 退化：全量快照 + 水位线跳过已折叠部分（逻辑增量）
-          const snap = await sessionQuery.readSession(id)
-          const events = (snap && snap.events) || []
-          for (let i = 0; i < events.length; i += 1) {
-            if (disposed) return
-            const ev = events[i]
-            if (typeof ev.seq === 'number' && ev.seq < fromSeq) continue
-            foldEvent(id, ev)
+          loaded.sessions.set(id, { lastSeq: r.lastSeq, tokens: number(r.tokens),
+            chatMs: number(r.chatMs), turns: number(r.turns), createdAt: number(r.createdAt),
+            model: r.model || null })
+        }
+        for (const [id, r] of snap.modelStats) {
+          loaded.modelStats.set(id, { tokens: number(r.tokens), requests: number(r.requests) })
+        }
+        for (const [id, time] of snap.openTurns) loaded.openTurns.set(id, number(time))
+        state = loaded
+        return true
+      } catch (e) {
+        return false
+      }
+    }
+
+    // All reads belong to one transaction. A failed read keeps the last complete
+    // state and buffered events for a later retry, instead of publishing half a scan.
+    function startScan(rebuild, onlyIds) {
+      scanning = true
+      buffering = true
+      scanPromise = Promise.resolve().then(async () => {
+        if (disposed) return
+        if (!sessionQuery) throw new Error('sessionQuery service is required to scan token usage')
+        const target = rebuild ? emptyState() : cloneState(state)
+        const seen = new Set()
+        let count = 0
+        async function readHeaders(headers) {
+          const jobs = []
+          for (const item of headers || []) {
+            const header = item && item.header ? item.header : item
+            if (!header || !header.id || seen.has(header.id)) continue
+            const id = header.id
+            seen.add(id)
+            const rec = sessionRec(target, id, header.createdAt)
+            const from = rec.lastSeq + 1
+            jobs.push(Promise.resolve().then(async () => {
+              let snap
+              if (!rebuild && typeof sessionPersistence?.readFrom === 'function') {
+                snap = await sessionPersistence.readFrom(id, from)
+              } else {
+                snap = await sessionQuery.readSession(id)
+              }
+              if (disposed) return
+              foldEvents(target, id, (snap && snap.events) || [])
+              count += 1
+            }))
           }
+          await Promise.all(jobs)
         }
-        scannedSessions += 1
-      } catch (e) {
-        console.error('[dsh-token-usage-dashboard] incremental read failed:', id, String(e))
-      }
-    }
-
-    async function syncDelta() {
-      if (scanning || disposed) return
-      scanning = true
-      try {
-        const list = sessionPersistence !== undefined
-          ? await sessionPersistence.list()
-          : await sessionQuery.listSessions()
-        const jobs = []
-        for (const item of list || []) {
-          if (disposed) return
-          const header = item && item.header ? item.header : item
-          if (!header || !header.id) continue
-          const rec = sessions.get(header.id)
-          // 快照里已有的会话：只读新增；全新会话：从头读
-          const from = rec ? rec.lastSeq + 1 : 0
-          if (!rec) sessionRec(header.id, header.createdAt)
-          jobs.push(foldDelta(header.id, from))
+        const headers = onlyIds && !retryAll ? Array.from(onlyIds, id => ({ id })) :
+          !rebuild && sessionPersistence !== undefined ? await sessionPersistence.list() :
+            await sessionQuery.listSessions()
+        await readHeaders(headers)
+        // Seeded sessions can be created after list() and before the final commit.
+        // Read their prefix before applying the live suffix.
+        while (Array.from(createdSessions).some(id => !seen.has(id))) {
+          await readHeaders(Array.from(createdSessions, id => ({ id })))
         }
-        await Promise.all(jobs)
-        // 快照里有、列表里没有的会话（已删除）：跳过 → 历史统计保留
-      } catch (e) {
-        console.error('[dsh-token-usage-dashboard] syncDelta failed:', String(e))
-      } finally {
-        scanning = false
-        ready = true
-        markDirty() // 同步后落盘一次（水位线推进）
-      }
-    }
-
-    // ---- 无快照路径：v6 全量 backfill（liveFloor + force 头部补折）----
-    async function foldSession(id) {
-      const rec = sessionRec(id)
-      try {
-        const snap = await sessionQuery.readSession(id)
-        const events = (snap && snap.events) || []
-        for (let i = 0; i < events.length; i += 1) {
-          if (disposed) return
-          const ev = events[i]
-          // 实时流已覆盖尾部（seq >= liveFloor，折叠过且推进了 lastSeq）；
-          // 回放只 force 补折头部（seq < liveFloor，实时流从未见过）——不重不漏
-          if (typeof ev.seq === 'number' && ev.seq >= rec.liveFloor) continue
-          foldEvent(id, ev, true)
-        }
-        scannedSessions += 1
-      } catch (e) {
-        console.error('[dsh-token-usage-dashboard] readSession failed:', id, e)
-      }
-    }
-
-    async function backfill() {
-      if (!sessionQuery || scanning) return
-      scanning = true
-      try {
-        const list = await sessionQuery.listSessions()
-        // 并发折叠全部会话（水位线去重保证与实时增量不重不漏）
-        const jobs = []
-        for (const item of list || []) {
-          if (disposed) return
-          const header = item && item.header
-          if (!header || !header.id) continue
-          sessionRec(header.id, header.createdAt)
-          jobs.push(foldSession(header.id))
-        }
-        await Promise.all(jobs)
-      } catch (e) {
-        console.error('[dsh-token-usage-dashboard] listSessions failed:', e)
-      } finally {
-        scanning = false
+        if (disposed) return
+        for (const [id, events] of bufferedEvents) foldEvents(target, id, events)
+        state = target
+        retryAll = false
+        createdSessions.clear()
+        bufferedEvents.clear()
+        buffering = false
+        scannedSessions = count
         ready = true
         markDirty()
-      }
+      }).catch(error => {
+        // A later session-created scan must also recover every failed prefix
+        // before committing the shared live-event buffer.
+        retryAll = true
+        throw error
+      }).finally(() => {
+        scanning = false
+        scanPromise = null
+        // Creation may race with the promise finalizer after a successful commit.
+        // Failed scans keep buffering=true and retry only on a later request/event.
+        if (!disposed && !buffering && (createdSessions.size || bufferedEvents.size)) {
+          return syncDelta().catch(reportScanError)
+        }
+      })
+      return scanPromise
     }
 
-    // 实时增量：水位线保证与增量同步不重复计数；记录 liveFloor 供全量回放头部补折
+    function syncDelta(ids) {
+      if (disposed) return Promise.resolve()
+      if (scanPromise) return scanPromise
+      return startScan(false, ids)
+    }
+
+    // A rescan always rebuilds current logs, including clearing deleted sessions.
+    // Concurrent callers share the same completed result, never an early return.
+    function backfill() {
+      if (rescanPromise) return rescanPromise
+      rescanPromise = Promise.resolve().then(async () => {
+        await startupPromise
+        if (scanPromise) await scanPromise
+        if (!disposed) await startScan(true)
+      }).finally(() => { rescanPromise = null })
+      return rescanPromise
+    }
+
+    function reportScanError(error) {
+      console.error('[dsh-token-usage-dashboard] scan failed:', String(error))
+    }
+
     ctx.on('session/event', (session, event) => {
-      if (!session || !event) return
-      const rec = sessionRec(session.id)
-      if (typeof event.seq === 'number') {
-        rec.liveFloor = Math.min(rec.liveFloor, event.seq)
+      if (disposed || !session || !event) return
+      if (!state.sessions.has(session.id)) createdSessions.add(session.id)
+      if (buffering || createdSessions.size) {
+        let events = bufferedEvents.get(session.id)
+        if (!events) bufferedEvents.set(session.id, events = [])
+        events.push(event)
+        if (!initializing && !scanPromise) syncDelta().catch(reportScanError)
+      } else {
+        foldEvent(state, session.id, event)
+        markDirty()
       }
-      foldEvent(session.id, event)
-      markDirty()
     })
 
-    // 新出现的会话：seed/恢复的历史不重新 emit，补折一次
     ctx.on('session/created', (session) => {
-      if (!sessionQuery || !session) return
-      const id = session.id
-      sessionRec(id)
-      Promise.resolve().then(async () => {
-        if (disposed) return
-        const rec = sessions.get(id)
-        const from = rec && rec.lastSeq >= 0 ? rec.lastSeq + 1 : 0
-        await foldDelta(id, from)
-        markDirty()
-      })
+      if (disposed || !session) return
+      createdSessions.add(session.id)
+      if (!initializing && !scanPromise) syncDelta(new Set([session.id])).catch(reportScanError)
     })
 
     function buildPayload() {
+      const { days, sessions, modelStats, totalTokens, totalRequests, peakStepTokens,
+        longestTurnMs, longestChatMs, longestChatSessionId } = state
       const dayList = []
       let peakDay = null
       for (const entry of days) {
@@ -443,27 +481,30 @@ return {
 
     // 周期 flush：timer 服务可用时 10s 检查一次脏标记
     if (timer !== undefined) {
-      const stop = timer.interval(() => { flushSave() }, 10000)
+      const stop = timer.interval(() => flushSave(), 10000)
       if (typeof stop === 'function') disposers.push(stop)
     }
 
-    ctx.effect(() => () => {
+    ctx.effect(() => async () => {
       disposed = true
-      flushSave() // 卸载前尽力落盘（best effort）
       for (const d of disposers) {
         try { d() } catch (e) { /* ignore */ }
       }
+      await flushSave() // Drain writes before releasing this plugin's unit.
+      await closeStorage()
     })
 
-    // 启动：优先快照（立即出数 + 增量同步），否则全量回补
-    Promise.resolve().then(async () => {
+    // Start buffering before reading the snapshot; otherwise live events arriving
+    // during load or replay can advance the persisted watermark past missing history.
+    const startupPromise = Promise.resolve().then(async () => {
       if (disposed) return
-      const ok = await loadSnapshot()
-      if (ok) {
-        ready = true // 快照即历史真相：直接就绪，不显示扫描占位
-        await syncDelta()
-      } else {
-        await backfill()
+      const loaded = await loadSnapshot()
+      if (loaded) ready = true
+      await startScan(!loaded)
+    }).catch(reportScanError).finally(() => {
+      initializing = false
+      if (!disposed && !buffering && (createdSessions.size || bufferedEvents.size)) {
+        return syncDelta().catch(reportScanError)
       }
     })
   },

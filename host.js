@@ -49,6 +49,9 @@ return {
   apply(ctx, config = {}) {
     const SNAPSHOT_PATH = snapshotPath(ctx, config)
     const sessionQuery = ctx.get('sessionQuery')
+    if (typeof sessionQuery?.listSessions !== 'function' || typeof sessionQuery?.readSession !== 'function') {
+      throw new Error('dsh-token-usage-dashboard: Harness requires sessionQuery.listSessions and sessionQuery.readSession')
+    }
     const sessionPersistence = ctx.get('sessionPersistence')
     const storage = ctx.get('storage')
     const fs = SNAPSHOT_PATH === null ? undefined : ctx.get('fs')

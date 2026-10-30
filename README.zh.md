@@ -43,6 +43,8 @@ Codex 个人主页风格的 Token 用量统计仪表盘：5 统计卡 + GitHub �
 
 同一宿主仅启用一种形态。Bundle 与 Dynamic 共用 `token_stats` 存储单元，该单元同时只允许一个活动句柄。
 
+插件不设 Harness 版本门槛。两种 Host 形态启动时检查会话查询接口，Bundle 还检查认证 Fetch 注册接口；可选的增量读取仍保留完整日志回退。实测版本和固定测试夹具另见验证记录。
+
 ## 自动化测试
 
 执行 `npm ci && npm test`，运行覆盖两种 Host 实现的回归测试。真实 Harness HTTP 与原生存储集成测试需要 Node 24 与 Harness 源码检出；运行命令、固定的契约版本和覆盖边界见 [TESTING.md](TESTING.md)。

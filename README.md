@@ -41,7 +41,7 @@ Both forms use the host's `storage` / `storage.backend.json` services for persis
 
 Enable only one form per host. Bundle and Dynamic share the `token_stats` storage unit, which permits one active handle at a time.
 
-The plugin does not restrict Harness release numbers. Both host forms check the session-query APIs during activation; Bundle also requires the authenticated Fetch registry. Optional incremental reads keep their full-log fallback. Tested versions and the pinned test fixture are recorded separately from activation requirements.
+The installable bundle requires DeepSeek Harness `>=0.2.2-rc.2`. Both host forms check the session-query APIs during activation; Bundle also requires the authenticated Fetch registry. Optional incremental reads keep their full-log fallback. Tested versions and the pinned test fixture are recorded separately from activation requirements.
 
 ## Tests
 

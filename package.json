@@ -19,8 +19,7 @@
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-renderer",
         "@deepseek-ai/dsh-client-ui-settings-general"
       ],
       "platform": "web"
@@ -51,5 +50,8 @@
   "scripts": {
     "test": "node --test test/*.test.mjs",
     "test:integration": "node --test test/*.integration.test.mjs"
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.2"
   }
 }
